@@ -624,7 +624,7 @@ func (m Model) renderSubscriptionView() string {
 const ak9sLogo = `    _    _  ___   ____
    / \  | |/ / _ \/ ___|
   / _ \ | ' / (_) \___ \
- / ___ \| . \ \__, |___) |
+ / ___ \| . \ \__,|___) |
 /_/   \_\_|\_\  /_/|____/`
 
 func renderLogo() string {
