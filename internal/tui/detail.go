@@ -2,7 +2,6 @@ package tui
 
 import (
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/hebo4096/ak9s/internal/azure"
@@ -18,6 +17,7 @@ func newDetailView(cluster azure.Cluster) detailView {
 	return detailView{
 		cluster:  cluster,
 		maxLines: 30,
+		scroll:   0,
 	}
 }
 
@@ -45,7 +45,34 @@ func (d *detailView) render(width int) string {
 	lines = append(lines, renderField("  Kubernetes Version", c.KubernetesVersion))
 
 	state := c.ProvisioningState
-	lines = append(lines, renderField("  Provisioning State", state))
+	if state != "" && state != "Succeeded" {
+		lines = append(lines, renderFieldRaw("  Provisioning State", stoppedStyle.Render(state)))
+		if c.ProvisioningError != "" {
+			errText := c.ProvisioningError
+			// Wrap error message to fit within terminal width
+			labelWidth := 22 // "  Operation Error: " label width
+			maxLen := width - labelWidth
+			if maxLen < 20 {
+				maxLen = 60
+			}
+			for i := 0; i < len(errText); i += maxLen {
+				end := i + maxLen
+				if end > len(errText) {
+					end = len(errText)
+				}
+				chunk := errText[i:end]
+				if i == 0 {
+					lines = append(lines, renderFieldRaw("  Operation Error", stoppedStyle.Render(chunk)))
+				} else {
+					lines = append(lines, "                      "+stoppedStyle.Render(chunk))
+				}
+			}
+		} else {
+			lines = append(lines, renderFieldRaw("  Error", statusStyle.Render("(loading...)")))
+		}
+	} else {
+		lines = append(lines, renderField("  Provisioning State", state))
+	}
 
 	powerLine := c.PowerState
 	if c.PowerState == "Running" {
@@ -179,7 +206,9 @@ func renderFieldRaw(label, value string) string {
 	return labelStyle.Render(label+":") + " " + value
 }
 
-var detailAnsiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+func isLetter(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
 
 // truncateVisual truncates a string to maxWidth visible characters,
 // preserving ANSI escape codes.
@@ -191,7 +220,7 @@ func truncateVisual(s string, maxWidth int) string {
 		// Check for ANSI escape sequence
 		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
 			j := i + 2
-			for j < len(s) && !((s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= 'a' && s[j] <= 'z')) {
+			for j < len(s) && !isLetter(s[j]) {
 				j++
 			}
 			if j < len(s) {
@@ -212,7 +241,7 @@ func truncateVisual(s string, maxWidth int) string {
 	for i < len(s) {
 		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
 			j := i + 2
-			for j < len(s) && !((s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= 'a' && s[j] <= 'z')) {
+			for j < len(s) && !isLetter(s[j]) {
 				j++
 			}
 			if j < len(s) {

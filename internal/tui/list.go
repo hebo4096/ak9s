@@ -10,38 +10,68 @@ import (
 
 type listView struct {
 	clusters []azure.Cluster
-	cursor   int
-	offset   int
-	height   int
+	cursor int
+	height int
+	page     int
+	perPage  int
 }
 
 func newListView(clusters []azure.Cluster) listView {
 	return listView{
 		clusters: clusters,
 		height:   20,
+		perPage:  7,
 	}
 }
 
 func (l *listView) up() {
-	if l.cursor > 0 {
+	if l.cursor > l.pageStart() {
 		l.cursor--
-		if l.cursor < l.offset {
-			l.offset = l.cursor
-		}
 	}
 }
 
 func (l *listView) down() {
-	if l.cursor < len(l.clusters)-1 {
+	if l.cursor < l.pageEnd()-1 {
 		l.cursor++
-		if l.cursor >= l.offset+l.visibleRows() {
-			l.offset = l.cursor - l.visibleRows() + 1
-		}
 	}
 }
 
-func (l *listView) visibleRows() int {
-	return l.height - 4 // header + column headers + border + status
+func (l *listView) nextPage() {
+	totalPages := l.totalPages()
+	if l.page < totalPages-1 {
+		l.page++
+	} else {
+		l.page = 0
+	}
+	l.cursor = l.pageStart()
+}
+
+func (l *listView) prevPage() {
+	if l.page > 0 {
+		l.page--
+	} else {
+		l.page = l.totalPages() - 1
+	}
+	l.cursor = l.pageStart()
+}
+
+func (l *listView) pageStart() int {
+	return l.page * l.perPage
+}
+
+func (l *listView) pageEnd() int {
+	end := l.pageStart() + l.perPage
+	if end > len(l.clusters) {
+		end = len(l.clusters)
+	}
+	return end
+}
+
+func (l *listView) totalPages() int {
+	if len(l.clusters) == 0 {
+		return 1
+	}
+	return (len(l.clusters) + l.perPage - 1) / l.perPage
 }
 
 func (l *listView) selected() *azure.Cluster {
@@ -49,10 +79,6 @@ func (l *listView) selected() *azure.Cluster {
 		return nil
 	}
 	return &l.clusters[l.cursor]
-}
-
-func (l *listView) render(width int) string {
-	return l.renderBody(width)
 }
 
 func (l *listView) renderBody(width int) string {
@@ -82,27 +108,30 @@ func (l *listView) renderBody(width int) string {
 	b.WriteString(" " + strings.Repeat("─", min(width-1, 119)))
 	b.WriteString("\n")
 	// Items
-	visible := l.visibleRows()
-	end := l.offset + visible
-	if end > len(l.clusters) {
-		end = len(l.clusters)
-	}
+	start := l.pageStart()
+	end := l.pageEnd()
 
-	for i := l.offset; i < end; i++ {
+	for i := start; i < end; i++ {
 		c := l.clusters[i]
-		stateIcon := "●"
-		if c.PowerState == "Running" {
+		var stateIcon string
+		switch c.PowerState {
+		case "Running":
 			stateIcon = runningStyle.Render("●")
-		} else if c.PowerState == "Stopped" {
+		case "Stopped":
 			stateIcon = stoppedStyle.Render("●")
+		default:
+			stateIcon = "●"
 		}
 
 		// Pad powerState manually to handle ANSI color codes
-		powerState := padRight(c.PowerState, 15)
-		if c.PowerState == "Running" {
+		var powerState string
+		switch c.PowerState {
+		case "Running":
 			powerState = runningStyle.Render(padRight(c.PowerState, 15))
-		} else if c.PowerState == "Stopped" {
+		case "Stopped":
 			powerState = stoppedStyle.Render(padRight(c.PowerState, 15))
+		default:
+			powerState = padRight(c.PowerState, 15)
 		}
 
 		// Build line without color for powerState when selected
@@ -140,14 +169,13 @@ func (l *listView) renderBody(width int) string {
 	b.WriteString("\n")
 
 	// Status bar
-	b.WriteString("\n")
-	status := fmt.Sprintf(" %d clusters | %d/%d",
-		len(l.clusters), l.cursor+1, len(l.clusters))
+	status := fmt.Sprintf(" %d clusters | %d/%d | Page %d/%d",
+		len(l.clusters), l.cursor+1, len(l.clusters), l.page+1, l.totalPages())
 	b.WriteString(statusStyle.Render(status))
 	b.WriteString("\n")
 
 	// Help
-	b.WriteString(helpStyle.Render("↑/k: up | ↓/j: down | enter: details | /help: usage | r: refresh | q: quit"))
+	b.WriteString(helpStyle.Render("↑/k: up | ↓/j: down | p/P: page | enter: details | /help: usage | r: refresh | q: quit"))
 
 	return b.String()
 }

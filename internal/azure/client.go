@@ -5,12 +5,15 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v4"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/kubernetesconfiguration/armkubernetesconfiguration"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armsubscriptions"
 )
 
@@ -53,6 +56,7 @@ type Cluster struct {
 	NodePools         []NodePool
 	Addons            []string
 	Extensions        []string
+	ProvisioningError string
 }
 
 // NodePool represents an AKS node pool.
@@ -236,6 +240,23 @@ func (c *Client) DeleteCluster(ctx context.Context, subscriptionID, resourceGrou
 	return nil
 }
 
+// DeleteResourceGroup deletes an Azure resource group.
+func (c *Client) DeleteResourceGroup(ctx context.Context, subscriptionID, resourceGroup string) error {
+	client, err := armresources.NewResourceGroupsClient(subscriptionID, c.cred, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create resource groups client: %w", err)
+	}
+	poller, err := client.BeginDelete(ctx, resourceGroup, nil)
+	if err != nil {
+		return fmt.Errorf("failed to delete resource group: %w", err)
+	}
+	_, err = poller.PollUntilDone(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed waiting for resource group deletion: %w", err)
+	}
+	return nil
+}
+
 func (c *Client) listClustersInSubscription(ctx context.Context, sub Subscription) ([]Cluster, error) {
 	client, err := armcontainerservice.NewManagedClustersClient(sub.ID, c.cred, nil)
 	if err != nil {
@@ -254,6 +275,14 @@ func (c *Client) listClustersInSubscription(ctx context.Context, sub Subscriptio
 			// Fetch extensions for this cluster
 			extensions, _ := c.listExtensions(ctx, sub.ID, cluster.ResourceGroup, cluster.Name)
 			cluster.Extensions = extensions
+			// For non-Succeeded clusters, re-fetch via Get API for latest state
+			if cluster.ProvisioningState != "" && cluster.ProvisioningState != "Succeeded" {
+				if latest, err := client.Get(ctx, cluster.ResourceGroup, cluster.Name, nil); err == nil {
+					cluster = mapCluster(&latest.ManagedCluster, sub)
+					cluster.Extensions = extensions
+				}
+				cluster.ProvisioningError = c.GetProvisioningError(ctx, sub.ID, cluster.ResourceID)
+			}
 			clusters = append(clusters, cluster)
 		}
 	}
@@ -280,6 +309,66 @@ func (c *Client) listExtensions(ctx context.Context, subscriptionID, resourceGro
 		}
 	}
 	return extensions, nil
+}
+
+// GetProvisioningError queries the AKS operations API for the most recent failed operation
+// on the given cluster and returns the error message.
+func (c *Client) GetProvisioningError(ctx context.Context, subscriptionID, resourceID string) string {
+	token, err := c.cred.GetToken(ctx, policy.TokenRequestOptions{
+		Scopes: []string{"https://management.azure.com/.default"},
+	})
+	if err != nil {
+		return ""
+	}
+
+	apiURL := fmt.Sprintf("https://management.azure.com%s/operations?api-version=2024-02-01", resourceID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Authorization", "Bearer "+token.Token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+
+	var result struct {
+		Value []struct {
+			Status string `json:"status"`
+			Error  struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		} `json:"value"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return ""
+	}
+
+	// Find the most recent failed operation (first in the list)
+	for _, op := range result.Value {
+		if op.Status == "Failed" && op.Error.Message != "" {
+			if op.Error.Code != "" {
+				return fmt.Sprintf("[%s] %s", op.Error.Code, op.Error.Message)
+			}
+			return op.Error.Message
+		}
+	}
+
+	return ""
 }
 
 func mapCluster(mc *armcontainerservice.ManagedCluster, sub Subscription) Cluster {
