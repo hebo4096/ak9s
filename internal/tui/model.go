@@ -47,6 +47,11 @@ type actionBatchDoneMsg struct {
 	logs []string
 }
 
+type provisioningErrorMsg struct {
+	clusterName string
+	errorMsg    string
+}
+
 type tickMsg time.Time
 
 // Model is the main TUI model.
@@ -54,7 +59,7 @@ type Model struct {
 	client        *azure.Client
 	state         viewState
 	list          listView
-	detail        detailView
+	detail        *detailView
 	loading       bool
 	err           error
 	width         int
@@ -71,6 +76,7 @@ type Model struct {
 	pendingAction func() (Model, tea.Cmd)
 	selectedSub string
 	subCursor   int
+	showHelp    bool
 }
 
 // New creates a new TUI model.
@@ -99,7 +105,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.list.height = msg.Height
-		m.detail.maxLines = msg.Height - 14
+		if m.detail != nil {
+			m.detail.maxLines = msg.Height - 14
+		}
 		return m, nil
 
 	case subsLoadedMsg:
@@ -120,12 +128,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case clustersLoadedMsg:
 		m.loading = false
 		cursor := m.list.cursor
-		offset := m.list.offset
+		page := m.list.page
 		m.list = newListView(msg.clusters)
 		m.list.height = m.height
 		if cursor < len(msg.clusters) {
 			m.list.cursor = cursor
-			m.list.offset = offset
+			m.list.page = page
 		}
 		return m, nil
 
@@ -143,7 +151,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case actionBatchDoneMsg:
-		m.logs = msg.logs
+		// Preserve existing logs (e.g., "Executed" entry) and append batch results
+		m.logs = append(m.logs, msg.logs...)
 		m.runningOps--
 		if m.runningOps <= 0 {
 			m.runningOps = 0
@@ -164,6 +173,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case errMsg:
 		m.loading = false
 		m.err = msg.err
+		return m, nil
+
+	case provisioningErrorMsg:
+		if m.detail != nil && m.detail.cluster.Name == msg.clusterName {
+			m.detail.cluster.ProvisioningError = msg.errorMsg
+		}
 		return m, nil
 
 	case tea.KeyMsg:
@@ -296,9 +311,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		if m.state == viewList {
 			if selected := m.list.selected(); selected != nil {
-				m.detail = newDetailView(*selected)
+				d := newDetailView(*selected)
+				m.detail = &d
 				m.detail.maxLines = m.height - 2
 				m.state = viewDetail
+				m.showHelp = false
 			}
 		}
 
@@ -313,6 +330,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.statusMsg = ""
 			return m, m.loadSelectedClusters
 		}
+
+	case "p":
+		if m.state == viewList {
+			m.list.nextPage()
+		}
+
+	case "P":
+		if m.state == viewList {
+			m.list.prevPage()
+		}
 	}
 
 	return m, nil
@@ -322,24 +349,12 @@ func (m Model) executeCommand() (tea.Model, tea.Cmd) {
 	cmd := m.commandBuf
 	m.state = viewList
 	m.commandBuf = ""
+	m.showHelp = false
 
 	// /help command
 	if cmd == "/help" {
 		m.statusMsg = ""
-		m.logs = []string{
-			"Available Commands:",
-			"",
-			"  /help                  Show this help",
-			"  /switch                Switch subscription",
-			"  /start NAME/RG         Start a cluster",
-			"  /stop NAME/RG          Stop a cluster",
-			"  /delete NAME/RG        Delete a cluster (with confirmation)",
-			"  /stop /bulk            Stop all clusters",
-			"  /delete /bulk          Delete all clusters (with confirmation)",
-			"",
-			"  Multiple targets: /start NAME1/RG1 NAME2/RG2",
-			"  Tab: command & cluster name completion",
-		}
+		m.showHelp = true
 		return m, nil
 	}
 
@@ -358,14 +373,15 @@ func (m Model) executeCommand() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.runningOps++
-		m.logs = nil
+		m.logs = []string{fmt.Sprintf("[%s] Executed: %s", time.Now().Format("2006/01/02 15:04:05"), cmd)}
 		return m, m.runParallel("Stopping", clusters, func(ctx context.Context, c azure.Cluster) error {
 			return m.client.StopCluster(ctx, c.SubscriptionID, c.ResourceGroup, c.Name)
 		})
 	}
 
 	// /delete /bulk - delete all clusters in parallel
-	if cmd == "/delete /bulk" {
+	if cmd == "/delete /bulk" || cmd == "/delete /bulk /r" {
+		deleteRG := strings.HasSuffix(cmd, " /r")
 		clusters := m.list.clusters
 		if len(clusters) == 0 {
 			m.statusMsg = "No clusters to delete"
@@ -377,10 +393,28 @@ func (m Model) executeCommand() (tea.Model, tea.Cmd) {
 		}
 		var confirmLines []string
 		confirmLines = append(confirmLines, "")
-		confirmLines = append(confirmLines, fmt.Sprintf("  The following %d cluster(s) will be deleted:", len(clusters)))
+		if deleteRG {
+			confirmLines = append(confirmLines, fmt.Sprintf("  The following %d cluster(s) and their resource groups will be deleted:", len(clusters)))
+		} else {
+			confirmLines = append(confirmLines, fmt.Sprintf("  The following %d cluster(s) will be deleted:", len(clusters)))
+		}
 		confirmLines = append(confirmLines, "")
 		for _, name := range names {
 			confirmLines = append(confirmLines, "    • "+name)
+		}
+		if deleteRG {
+			confirmLines = append(confirmLines, "")
+			confirmLines = append(confirmLines, "  ⚠ Resource groups will also be deleted!")
+			others := m.findOtherClustersInRGs(clusters)
+			if len(others) > 0 {
+				confirmLines = append(confirmLines, "")
+				confirmLines = append(confirmLines, "  The following AKS clusters in the same resource groups will also be deleted:")
+				for rg, names := range others {
+					for _, name := range names {
+						confirmLines = append(confirmLines, fmt.Sprintf("    • %s/%s", name, rg))
+					}
+				}
+			}
 		}
 		confirmLines = append(confirmLines, "")
 		confirmLines = append(confirmLines, "  Do you really want to execute this? (y/n)")
@@ -388,7 +422,12 @@ func (m Model) executeCommand() (tea.Model, tea.Cmd) {
 		m.confirmMsg = strings.Join(confirmLines, "\n")
 		m.pendingAction = func() (Model, tea.Cmd) {
 			m.runningOps++
-			m.logs = nil
+			m.logs = []string{fmt.Sprintf("[%s] Executed: %s", time.Now().Format("2006/01/02 15:04:05"), cmd)}
+			if deleteRG {
+				return m, m.runParallel("Deleting (with RG)", clusters, func(ctx context.Context, c azure.Cluster) error {
+					return m.client.DeleteResourceGroup(ctx, c.SubscriptionID, c.ResourceGroup)
+				})
+			}
 			return m, m.runParallel("Deleting", clusters, func(ctx context.Context, c azure.Cluster) error {
 				return m.client.DeleteCluster(ctx, c.SubscriptionID, c.ResourceGroup, c.Name)
 			})
@@ -396,11 +435,25 @@ func (m Model) executeCommand() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// /start NAME/RG, /stop NAME/RG, /delete NAME/RG
+	// /start NAME/RG, /stop NAME/RG, /delete NAME/RG [/r]
 	if strings.HasPrefix(cmd, "/start ") || strings.HasPrefix(cmd, "/stop ") || strings.HasPrefix(cmd, "/delete ") {
 		parts := strings.SplitN(cmd, " ", 2)
 		action := parts[0]
 		args := strings.Fields(parts[1])
+
+		// Check for /r flag in /delete
+		deleteRG := false
+		if action == "/delete" {
+			var filteredArgs []string
+			for _, a := range args {
+				if a == "/r" {
+					deleteRG = true
+				} else {
+					filteredArgs = append(filteredArgs, a)
+				}
+			}
+			args = filteredArgs
+		}
 
 		var targets []azure.Cluster
 		var notFound []string
@@ -435,17 +488,13 @@ func (m Model) executeCommand() (tea.Model, tea.Cmd) {
 		actionFn := func(ctx context.Context, c azure.Cluster) error {
 			return m.client.StartCluster(ctx, c.SubscriptionID, c.ResourceGroup, c.Name)
 		}
-		if action == "/stop" {
+		switch action {
+		case "/stop":
 			actionLabel = "Stopping"
 			actionFn = func(ctx context.Context, c azure.Cluster) error {
 				return m.client.StopCluster(ctx, c.SubscriptionID, c.ResourceGroup, c.Name)
 			}
-		} else if action == "/delete" {
-			actionLabel = "Deleting"
-			actionFn = func(ctx context.Context, c azure.Cluster) error {
-				return m.client.DeleteCluster(ctx, c.SubscriptionID, c.ResourceGroup, c.Name)
-			}
-
+		case "/delete":
 			// Show confirmation for delete
 			names := make([]string, len(targets))
 			for i, t := range targets {
@@ -453,10 +502,28 @@ func (m Model) executeCommand() (tea.Model, tea.Cmd) {
 			}
 			var confirmLines []string
 			confirmLines = append(confirmLines, "")
-			confirmLines = append(confirmLines, fmt.Sprintf("  The following %d cluster(s) will be deleted:", len(targets)))
+			if deleteRG {
+				confirmLines = append(confirmLines, fmt.Sprintf("  The following %d cluster(s) and their resource groups will be deleted:", len(targets)))
+			} else {
+				confirmLines = append(confirmLines, fmt.Sprintf("  The following %d cluster(s) will be deleted:", len(targets)))
+			}
 			confirmLines = append(confirmLines, "")
 			for _, name := range names {
 				confirmLines = append(confirmLines, "    • "+name)
+			}
+			if deleteRG {
+				confirmLines = append(confirmLines, "")
+				confirmLines = append(confirmLines, "  ⚠ Resource groups will also be deleted!")
+				others := m.findOtherClustersInRGs(targets)
+				if len(others) > 0 {
+					confirmLines = append(confirmLines, "")
+					confirmLines = append(confirmLines, "  The following AKS clusters in the same resource groups will also be deleted:")
+					for rg, clusterNames := range others {
+						for _, name := range clusterNames {
+							confirmLines = append(confirmLines, fmt.Sprintf("    • %s/%s", name, rg))
+						}
+					}
+				}
 			}
 			confirmLines = append(confirmLines, "")
 			confirmLines = append(confirmLines, "  Do you really want to execute this? (y/n)")
@@ -465,7 +532,12 @@ func (m Model) executeCommand() (tea.Model, tea.Cmd) {
 			finalTargets := targets
 			m.pendingAction = func() (Model, tea.Cmd) {
 				m.runningOps++
-				m.logs = nil
+				m.logs = []string{fmt.Sprintf("[%s] Executed: %s", time.Now().Format("2006/01/02 15:04:05"), cmd)}
+				if deleteRG {
+					return m, m.runParallel("Deleting (with RG)", finalTargets, func(ctx context.Context, c azure.Cluster) error {
+						return m.client.DeleteResourceGroup(ctx, c.SubscriptionID, c.ResourceGroup)
+					})
+				}
 				return m, m.runParallel("Deleting", finalTargets, func(ctx context.Context, c azure.Cluster) error {
 					return m.client.DeleteCluster(ctx, c.SubscriptionID, c.ResourceGroup, c.Name)
 				})
@@ -474,12 +546,32 @@ func (m Model) executeCommand() (tea.Model, tea.Cmd) {
 		}
 
 		m.runningOps++
-		m.logs = nil
+		m.logs = []string{fmt.Sprintf("[%s] Executed: %s", time.Now().Format("2006/01/02 15:04:05"), cmd)}
 		return m, m.runParallel(actionLabel, targets, actionFn)
 	}
 
 	m.statusMsg = fmt.Sprintf("Unknown command: %s (type /help for usage)", cmd)
 	return m, nil
+}
+
+// findOtherClustersInRGs finds clusters in the same resource groups that are NOT in the target list.
+func (m Model) findOtherClustersInRGs(targets []azure.Cluster) map[string][]string {
+	targetRGs := make(map[string]bool)
+	targetKeys := make(map[string]bool)
+	for _, t := range targets {
+		targetRGs[strings.ToLower(t.ResourceGroup)] = true
+		targetKeys[strings.ToLower(t.Name)+"/"+strings.ToLower(t.ResourceGroup)] = true
+	}
+
+	others := make(map[string][]string)
+	for _, c := range m.list.clusters {
+		rgLower := strings.ToLower(c.ResourceGroup)
+		key := strings.ToLower(c.Name) + "/" + rgLower
+		if targetRGs[rgLower] && !targetKeys[key] {
+			others[c.ResourceGroup] = append(others[c.ResourceGroup], c.Name)
+		}
+	}
+	return others
 }
 
 // runParallel runs an action on multiple clusters concurrently, sending log messages via a tea.Program.
@@ -508,24 +600,27 @@ func (m Model) runParallel(actionLabel string, clusters []azure.Cluster, fn func
 			close(resCh)
 		}()
 
+		now := time.Now().Format("2006/01/02 15:04:05")
 		var logs []string
 		for _, c := range clusters {
-			logs = append(logs, fmt.Sprintf("%s %s/%s ...", actionLabel, c.Name, c.ResourceGroup))
+			logs = append(logs, fmt.Sprintf("[%s] ⏳ %s %s/%s ...", now, actionLabel, c.Name, c.ResourceGroup))
 		}
 
 		successes := 0
 		failures := 0
 		for r := range resCh {
+			t := time.Now().Format("2006/01/02 15:04:05")
 			if r.err != nil {
-				logs = append(logs, fmt.Sprintf("✗ %s %s failed: %v", actionLabel, r.label, r.err))
+				logs = append(logs, fmt.Sprintf("[%s] ✗ %s %s failed: %v", t, actionLabel, r.label, r.err))
 				failures++
 			} else {
-				logs = append(logs, fmt.Sprintf("✓ %s %s done", actionLabel, r.label))
+				logs = append(logs, fmt.Sprintf("[%s] ✓ %s %s done", t, actionLabel, r.label))
 				successes++
 			}
 		}
 
-		logs = append(logs, fmt.Sprintf("Completed: %d succeeded, %d failed", successes, failures))
+		t := time.Now().Format("2006/01/02 15:04:05")
+		logs = append(logs, fmt.Sprintf("[%s] Completed: %d succeeded, %d failed", t, successes, failures))
 
 		return actionBatchDoneMsg{logs: logs}
 	}
@@ -555,7 +650,7 @@ func (m *Model) buildCompletions() []string {
 	buf := m.commandBuf
 
 	// Base commands
-	baseCommands := []string{"/start", "/stop", "/stop /bulk", "/delete", "/delete /bulk", "/switch", "/help"}
+	baseCommands := []string{"/start", "/stop", "/stop /bulk", "/delete", "/delete /bulk", "/delete /bulk /r", "/switch", "/help"}
 
 	// If just typing the command prefix, complete commands
 	if !strings.Contains(buf, " ") || buf == "/stop " || buf == "/stop /b" || buf == "/delete " || buf == "/delete /b" {
@@ -636,7 +731,7 @@ func renderLogo() string {
 func (m Model) renderHeader() string {
 	var b strings.Builder
 	b.WriteString(renderLogo())
-	b.WriteString("\n\n")
+	b.WriteString("\n")
 
 	line := strings.Repeat("─", 90)
 
@@ -665,7 +760,7 @@ func (m Model) renderHeader() string {
 	b.WriteString(statusStyle.Render(fmt.Sprintf("   User:         %s (%s)", m.userInfo.UPN, m.userInfo.Name)))
 	b.WriteString("\n")
 	b.WriteString(statusStyle.Render(line))
-	b.WriteString("\n\n")
+	b.WriteString("\n")
 	return b.String()
 }
 
@@ -686,10 +781,12 @@ func (m Model) View() string {
 	var view string
 	switch m.state {
 	case viewDetail:
-		// Use a large maxLines, then trim the final output to fit terminal
-		m.detail.maxLines = 200
-		full := header + m.detail.render(m.width)
-		return fitToHeight(full, m.width, m.height)
+		headerLines := countVisualLines(header, m.width)
+		m.detail.maxLines = m.height - headerLines
+		if m.detail.maxLines < 1 {
+			m.detail.maxLines = 1
+		}
+		return fitToHeight(header+m.detail.render(m.width), m.width, m.height)
 	case viewSubscription:
 		return renderLogo() + "\n\n" + m.renderSubscriptionView()
 	case viewCommand:
@@ -705,6 +802,25 @@ func (m Model) View() string {
 
 	if m.statusMsg != "" {
 		view += "\n" + statusMsgStyle.Render("  "+m.statusMsg)
+	}
+
+	// Help section (above Operation Logs)
+	var helpSection string
+	if m.showHelp {
+		helpSection += statusStyle.Render(strings.Repeat("─", 90)) + "\n"
+		helpSection += statusStyle.Render("  Available Commands:") + "\n"
+		helpSection += statusStyle.Render("    /help                  Show this help") + "\n"
+		helpSection += statusStyle.Render("    /switch                Switch subscription") + "\n"
+		helpSection += statusStyle.Render("    /start NAME/RG         Start a cluster") + "\n"
+		helpSection += statusStyle.Render("    /stop  NAME/RG         Stop a cluster") + "\n"
+		helpSection += statusStyle.Render("    /delete NAME/RG        Delete a cluster") + "\n"
+		helpSection += statusStyle.Render("    /delete NAME/RG /r     Delete cluster + RG") + "\n"
+		helpSection += statusStyle.Render("    /stop  /bulk           Stop all clusters") + "\n"
+		helpSection += statusStyle.Render("    /delete /bulk          Delete all clusters") + "\n"
+		helpSection += statusStyle.Render("    /delete /bulk /r       Delete all + RGs") + "\n"
+		helpSection += statusStyle.Render("  Multiple: /start N1/RG1 N2/RG2") + "\n"
+		helpSection += statusStyle.Render("  Tab: command & cluster name completion") + "\n"
+		helpSection += helpStyle.Render("  Press any key to close")
 	}
 
 	// Build the Operation Logs section
@@ -723,17 +839,24 @@ func (m Model) View() string {
 	}
 
 	// Calculate padding to push Operation Logs to a fixed position
-	viewLines := strings.Count(view, "\n") + 1
-	logsLines := strings.Count(logsSection, "\n") + 1
-	totalUsed := viewLines + logsLines
+	viewLines := countVisualLines(view, m.width)
+	helpLines := 0
+	if helpSection != "" {
+		helpLines = countVisualLines(helpSection, m.width)
+	}
+	logsLines := countVisualLines(logsSection, m.width)
+	totalUsed := viewLines + helpLines + logsLines
 	padding := m.height - totalUsed
 	if padding < 1 {
 		padding = 1
 	}
 	view += strings.Repeat("\n", padding)
+	if helpSection != "" {
+		view += helpSection + "\n"
+	}
 	view += logsSection
 
-	return view
+	return fitToHeight(view, m.width, m.height)
 }
 
 func (m Model) loadSubscriptions() tea.Msg {

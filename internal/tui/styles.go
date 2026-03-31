@@ -9,16 +9,7 @@ var (
 	errorColor     = lipgloss.Color("#FF6B6B")
 	mutedColor     = lipgloss.Color("#626262")
 	highlightColor = lipgloss.Color("#FFFFFF")
-	bgColor        = lipgloss.Color("#1A1A2E")
-	selectedBg     = lipgloss.Color("#3D3D5C")
-	selectedFg     = lipgloss.Color("#FFFFFF")
-
-	// Title bar
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(highlightColor).
-			Background(primaryColor).
-			Padding(0, 2)
+	selectedBg = lipgloss.Color("#3D3D5C")
 
 	// Logo (no background)
 	logoStyle = lipgloss.NewStyle().
@@ -39,10 +30,6 @@ var (
 				Background(selectedBg).
 				Bold(true).
 				Padding(0, 2)
-
-	cursorStyle = lipgloss.NewStyle().
-			Foreground(primaryColor).
-			Bold(true)
 
 	// Detail view
 	headerStyle = lipgloss.NewStyle().
@@ -88,9 +75,4 @@ var (
 			Bold(true)
 )
 
-func powerStateStyle(state string) lipgloss.Style {
-	if state == "Running" {
-		return runningStyle
-	}
-	return stoppedStyle
-}
+
