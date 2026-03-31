@@ -22,7 +22,7 @@ A k9s-like TUI tool for managing Azure Kubernetes Service (AKS) clusters.
 
 ## Prerequisites
 
-- Go 1.21 or later
+- Go 1.25.8
 - Azure CLI (`az login`) or other Azure credentials configured via [DefaultAzureCredential](https://learn.microsoft.com/en-us/azure/developer/go/azure-sdk-authentication)
 
 ## Installation
